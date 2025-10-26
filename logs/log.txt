@@ -1,0 +1,5 @@
+Namespace(dataset='CUB', exp='Joint', seed=1, log_dir='logs/', batch_size=64, epochs=100, save_step=1000, lr=0.001, weight_decay=0.0004, pretrained=True, freeze=False, use_aux=False, use_attr=False, attr_loss_weight=0.01, no_img=False, bottleneck=False, weighted_loss='multiple', uncertain_labels=False, n_attributes=112, expand_dim=0, n_class_attr=2, data_dir='./', image_dir='images', resampling=False, end2end=True, optimizer='sgd', ckpt='1', scheduler_step=1000, normalize_loss=True, use_relu=False, use_sigmoid=False, connect_CY=False, three_class=False)
+None
+train data path: ./train.pkl
+New model best model at epoch 0
+Epoch [0]:	Train loss: 5.4281	Train accuracy: 0.7392	Val loss: 5.4281	Val acc: 0.7392	Best val epoch: 0
