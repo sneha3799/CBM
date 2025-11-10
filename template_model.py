@@ -1,6 +1,13 @@
 """
-Unified CBM architectures — InceptionV3/ResNet18/BcosResNet18
-BcosResNet18_Custom built to mirror ResNet18_Custom structure.
+Unified CBM Architectures — InceptionV3 / ResNet18 / BcosResNet18
+
+This module defines various neural network components for Concept Bottleneck Models (CBMs),
+including the end-to-end model, multilayer perceptrons (MLPs), and customized backbones based
+on ResNet18 and BcosResNet18. These architectures support multiple configurations:
+- Independent concept prediction (X → C)
+- Oracle and sequential models (C → Y, X → Ĉ → Y)
+- End-to-end concept-to-class pipelines (X → C → Y)
+- Multitask joint prediction (X → (C, Y))
 """
 
 import torch
@@ -22,13 +29,25 @@ __all__ = [
 #  End-to-End Concept Bottleneck Model
 # ================================
 class End2EndModel(nn.Module):
+    """
+    End-to-End Concept Bottleneck Model.
+
+    Connects two model stages:
+        1. `first_model`: maps input X → C (concept predictions)
+        2. `sec_model`: maps concepts C → Y (class predictions)
+
+    This unified wrapper enables both stages to be trained jointly or sequentially,
+    allowing for flexible CBM setups (InceptionV3, ResNet18, or BcosResNet18 backbones).
+
+    Args:
+        model1 (nn.Module): The feature extractor or concept predictor (X → C).
+        model2 (nn.Module): The classifier mapping predicted concepts to labels (C → Y).
+        use_relu (bool): Whether to apply ReLU activation on concept outputs before feeding into stage 2.
+        use_sigmoid (bool): Whether to apply Sigmoid activation on concept outputs before feeding into stage 2.
+        n_class_attr (int): Number of possible concept classes (2 for binary, 3 for ternary).
+    """
+
     def __init__(self, model1, model2, use_relu=False, use_sigmoid=False, n_class_attr=2):
-        """
-        End-to-end Concept Bottleneck Model that connects:
-            stage 1: X -> C (first_model)
-            stage 2: C -> Y (sec_model)
-        Works for both InceptionV3-based and ResNet18-based architectures.
-        """
         super().__init__()
         self.first_model = model1
         self.sec_model = model2
@@ -37,6 +56,21 @@ class End2EndModel(nn.Module):
         self.n_class_attr = n_class_attr
 
     def forward_stage2(self, stage1_out):
+        """
+        Processes stage 1 outputs through stage 2 (C → Y).
+
+        Handles activation normalization and concatenation of all concept outputs
+        before passing to the class predictor.
+
+        Args:
+            stage1_out (torch.Tensor | dict | list): Output(s) from the first model.
+
+        Returns:
+            list[torch.Tensor]: A list containing:
+                - The final class prediction from stage 2.
+                - All intermediate concept outputs from stage 1.
+        """
+
         if isinstance(stage1_out, dict):
             stage1_out = list(stage1_out.values())
 
@@ -54,6 +88,17 @@ class End2EndModel(nn.Module):
         return all_out
 
     def forward(self, x):
+        """
+        Performs a full forward pass through both stages.
+
+        Args:
+            x (torch.Tensor): Input batch of images.
+
+        Returns:
+            list[torch.Tensor] | tuple: If auxiliary outputs are present, returns a tuple
+            (main_outputs, aux_outputs); otherwise, returns a list of predictions.
+        """
+
         outputs = self.first_model(x)
         if isinstance(outputs, tuple) and len(outputs) == 2:
             outputs, aux_outputs = outputs
@@ -66,6 +111,18 @@ class End2EndModel(nn.Module):
 #  FC / MLP Utilities
 # ================================
 class FC(nn.Module):
+    """
+    Fully-Connected (FC) utility layer with optional expansion.
+
+    This module builds a simple feedforward block:
+    Input → Linear → [ReLU → Linear (optional)]
+
+    Args:
+        input_dim (int): Input feature dimensionality.
+        output_dim (int): Output dimensionality.
+        expand_dim (int, optional): Hidden layer dimension for intermediate expansion. Default = 0.
+    """
+
     def __init__(self, input_dim, output_dim, expand_dim=0):
         super().__init__()
         self.expand_dim = expand_dim
@@ -78,6 +135,16 @@ class FC(nn.Module):
             self.fc2 = None
 
     def forward(self, x):
+        """
+        Forward pass through the FC block.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Transformed output tensor.
+        """
+
         x = self.fc1(x)
         if self.fc2 is not None:
             x = self.relu(x)
@@ -86,6 +153,17 @@ class FC(nn.Module):
 
 
 class MLP(nn.Module):
+    """
+    Multi-Layer Perceptron (MLP) with optional hidden expansion.
+
+    Supports either a single linear layer or a two-layer MLP depending on `expand_dim`.
+
+    Args:
+        input_dim (int): Input dimensionality.
+        num_classes (int): Number of target classes.
+        expand_dim (int, optional): Hidden layer dimension for expansion. Default = 0.
+    """
+
     def __init__(self, input_dim, num_classes, expand_dim=0):
         super().__init__()
         self.expand_dim = expand_dim
@@ -98,6 +176,15 @@ class MLP(nn.Module):
             self.linear2 = None
 
     def forward(self, x):
+        """
+        Forward pass through the MLP.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output logits.
+        """
         x = self.linear1(x)
         if self.linear2 is not None:
             x = self.relu(x)
@@ -109,6 +196,25 @@ class MLP(nn.Module):
 #  Standard ResNet18 Backbone
 # ================================
 class ResNet18_Custom(nn.Module):
+    """
+    Custom ResNet18 backbone for Concept Bottleneck Models (CBM).
+
+    Supports:
+        - Standard classification (X → Y)
+        - Concept prediction (X → C)
+        - Connected multitask prediction (X → (C, Y))
+
+    Args:
+        pretrained (bool): Load ImageNet-pretrained weights if True.
+        freeze (bool): Freeze early convolutional layers.
+        num_classes (int): Number of target output classes.
+        n_attributes (int): Number of concept outputs.
+        bottleneck (bool): Whether to separate concept and class prediction (True = bottleneck).
+        expand_dim (int): Expansion dimension for intermediate FC layers.
+        three_class (bool): If True, predicts ternary concepts (3 outputs per concept).
+        connect_CY (bool): If True, connects concept predictions to class prediction head.
+    """
+
     def __init__(
         self,
         pretrained=False,
@@ -159,6 +265,18 @@ class ResNet18_Custom(nn.Module):
             self.cy_fc = None
 
     def forward(self, x):
+        """
+        Forward pass through the custom ResNet18.
+
+        Args:
+            x (torch.Tensor): Input images (B, C, H, W).
+
+        Returns:
+            list[torch.Tensor]: 
+                - First tensor: class logits (if applicable).
+                - Remaining tensors: concept predictions.
+        """
+
         x = self.features(x)
         x = torch.flatten(x, 1)
 
@@ -172,6 +290,18 @@ class ResNet18_Custom(nn.Module):
 
 
 def resnet18_custom(pretrained, freeze, **kwargs):
+    """
+    Factory function for `ResNet18_Custom`.
+
+    Args:
+        pretrained (bool): Whether to load pretrained weights.
+        freeze (bool): Whether to freeze early layers.
+        **kwargs: Additional arguments passed to `ResNet18_Custom`.
+
+    Returns:
+        ResNet18_Custom: Instantiated ResNet18-based CBM.
+    """
+
     return ResNet18_Custom(pretrained=pretrained, freeze=freeze, **kwargs)
 
 
@@ -179,6 +309,23 @@ def resnet18_custom(pretrained, freeze, **kwargs):
 #  Bcos-ResNet18 Backbone
 # ================================
 class BcosResNet18_Custom(nn.Module):
+    """
+    Custom Bcos-ResNet18 backbone for Concept Bottleneck Models.
+
+    Mirrors the structure of ResNet18_Custom but uses a Bcos variant of ResNet18
+    as the underlying feature extractor. Supports both binary and ternary concept outputs.
+
+    Args:
+        pretrained (bool): Load pretrained weights if available.
+        freeze (bool): Freeze early convolutional layers.
+        num_classes (int): Number of target classes.
+        n_attributes (int): Number of concept outputs.
+        bottleneck (bool): Whether to separate concept and class heads.
+        expand_dim (int): Hidden expansion dimension.
+        three_class (bool): If True, each concept predicts 3 logits.
+        connect_CY (bool): If True, connects concept and class prediction heads.
+    """
+
     def __init__(
         self,
         pretrained=False,
@@ -190,9 +337,6 @@ class BcosResNet18_Custom(nn.Module):
         three_class=False,
         connect_CY=False,
     ):
-        """
-        BcosResNet18 version of ResNet18_Custom
-        """
         super().__init__()
 
         self.n_attributes = n_attributes
@@ -233,6 +377,18 @@ class BcosResNet18_Custom(nn.Module):
             self.cy_fc = None
 
     def forward(self, x):
+        """
+        Forward pass through the Bcos-ResNet18 backbone.
+
+        Args:
+            x (torch.Tensor): Input image tensor (B, C, H, W).
+
+        Returns:
+            list[torch.Tensor]: 
+                - First tensor: class logits (if applicable).
+                - Remaining tensors: concept predictions.
+        """
+
         feats = self.backbone.forward_features(x)
         feats = F.adaptive_avg_pool2d(feats, (1, 1))
         feats = torch.flatten(feats, 1)
@@ -248,6 +404,15 @@ class BcosResNet18_Custom(nn.Module):
 
 def bcos_resnet18_custom(pretrained, freeze, **kwargs):
     """
-    Factory function for BcosResNet18_Custom (CBM-compatible).
+    Factory function for `BcosResNet18_Custom`.
+
+    Args:
+        pretrained (bool): Whether to load pretrained weights.
+        freeze (bool): Whether to freeze early layers.
+        **kwargs: Additional arguments passed to `BcosResNet18_Custom`.
+
+    Returns:
+        BcosResNet18_Custom: Instantiated Bcos-ResNet18-based CBM.
     """
+    
     return BcosResNet18_Custom(pretrained=pretrained, freeze=freeze, **kwargs)

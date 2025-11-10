@@ -1,6 +1,18 @@
 """
-Train InceptionV3 Network using the CUB-200-2011 dataset
+Train InceptionV3/BcosResNet18 Concept Bottleneck Models on the CUB-200-2011 dataset.
+
+This script supports multiple architectures and training paradigms including:
+- X → C       : Concept prediction
+- C → Y       : Oracle classifier using ground-truth concepts
+- X → Ĉ → Y   : Sequential (two-stage) model
+- X → Y       : Standard CNN classifier
+- X → (C, Y)  : Multitask model
+- X → C → Y   : End-to-end Concept Bottleneck Model (joint training)
+
+Includes training, validation, logging, model checkpointing, and optional
+support for weighted losses, resampling, uncertain labels, and early stopping.
 """
+
 import pdb
 import os
 import sys
@@ -21,8 +33,26 @@ from models import ModelXtoCY, ModelXtoChat_ChatToY, ModelXtoY, ModelXtoC, Model
 
 def run_epoch_simple(model, optimizer, loader, loss_meter, acc_meter, criterion, args, is_training):
     """
-    A -> Y: Predicting class labels using only attributes with MLP
+    Train or evaluate a simple attribute-to-class (A → Y) MLP model.
+
+    This function handles cases where inputs are concept activations rather than images.
+    It computes forward passes, classification loss, and top-1 accuracy, and optionally
+    performs optimization during training.
+
+    Args:
+        model (nn.Module): Model to train or evaluate.
+        optimizer (torch.optim.Optimizer): Optimizer for model parameters.
+        loader (DataLoader): DataLoader providing attribute and label batches.
+        loss_meter (AverageMeter): Tracks average loss across batches.
+        acc_meter (AverageMeter): Tracks average accuracy across batches.
+        criterion (nn.Module): Loss function (e.g., CrossEntropyLoss).
+        args (argparse.Namespace): Experiment configuration.
+        is_training (bool): Whether to train (True) or only evaluate (False).
+
+    Returns:
+        tuple: Updated (loss_meter, acc_meter).
     """
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_training:
         model.train()
@@ -59,9 +89,30 @@ def run_epoch_simple(model, optimizer, loader, loss_meter, acc_meter, criterion,
 
 def run_epoch(model, optimizer, loader, loss_meter, acc_meter, criterion, attr_criterion, args, is_training):
     """
-    For the rest of the networks (X -> A, cotraining, simple finetune)
-    Robust to models with/without aux outputs (Inception vs BcosResNet).
+    Runs one full training or evaluation epoch for CNN-based architectures (e.g., InceptionV3, BcosResNet18).
+
+    Supports various Concept Bottleneck configurations:
+        - Standard classification (X → Y)
+        - Bottleneck attribute prediction (X → C)
+        - Joint/Multitask setups (X → (C, Y))
+        - End-to-end CBM (X → C → Y)
+    Compatible with auxiliary logits (Inception-style) and both binary and multiclass attributes.
+
+    Args:
+        model (nn.Module): Model to train or evaluate.
+        optimizer (torch.optim.Optimizer): Optimizer for model parameters.
+        loader (DataLoader): DataLoader providing inputs, labels, and attributes.
+        loss_meter (AverageMeter): Tracks average loss.
+        acc_meter (AverageMeter): Tracks average accuracy.
+        criterion (nn.Module): Primary classification loss function.
+        attr_criterion (list[nn.Module] or None): List of attribute-level loss functions.
+        args (argparse.Namespace): Experiment configuration.
+        is_training (bool): Whether to perform backpropagation and optimization.
+
+    Returns:
+        tuple: Updated (loss_meter, acc_meter).
     """
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_training:
         model.train()
@@ -216,6 +267,23 @@ def run_epoch(model, optimizer, loader, loss_meter, acc_meter, criterion, attr_c
     return loss_meter, acc_meter
 
 def train(model, args):
+    """
+    Core training loop handling initialization, loss setup, optimizer scheduling, 
+    validation, checkpointing, and early stopping.
+
+    Supports weighted and unweighted attribute losses, auxiliary logits,
+    learning rate scheduling, and both image-based and concept-only models.
+
+    Args:
+        model (nn.Module): Model to train (e.g., ResNet18, BcosResNet18, MLP).
+        args (argparse.Namespace): Experiment configuration including hyperparameters.
+
+    Side Effects:
+        - Saves best-performing model checkpoint to args.log_dir.
+        - Logs metrics to log.txt.
+        - Prints current learning rate and early stopping messages.
+    """
+
     # Determine imbalance
     imbalance = None
     if args.use_attr and not args.no_img and args.weighted_loss:
@@ -336,49 +404,101 @@ def train(model, args):
             break
 
 def train_X_to_C(args):
+    """
+    Trains a model to predict visual concepts from images (X → C).
+    Typically the first stage of a Concept Bottleneck Model.
+    """
+
     model = ModelXtoC(pretrained=args.pretrained, freeze=args.freeze, num_classes=N_CLASSES, use_aux=args.use_aux,
                       n_attributes=args.n_attributes, expand_dim=args.expand_dim, three_class=args.three_class)
     train(model, args)
 
 def train_oracle_C_to_y_and_test_on_Chat(args):
+    """
+    Trains an oracle model to map ground-truth concepts to class labels (C → Y).
+    Tests on predicted concepts Ĉ during evaluation.
+    """
+
     model = ModelOracleCtoY(n_class_attr=args.n_class_attr, n_attributes=args.n_attributes,
                             num_classes=N_CLASSES, expand_dim=args.expand_dim)
     train(model, args)
 
 def train_Chat_to_y_and_test_on_Chat(args):
+    """
+    Trains a sequential model that maps predicted concepts Ĉ to labels Y.
+    """
+
     model = ModelXtoChat_ChatToY(n_class_attr=args.n_class_attr, n_attributes=args.n_attributes,
                                  num_classes=N_CLASSES, expand_dim=args.expand_dim)
     train(model, args)
 
 def train_X_to_C_to_y(args):
+    """
+    Trains a joint end-to-end Concept Bottleneck Model (X → C → Y).
+    The model simultaneously learns to predict both concepts and labels.
+    """
+
     model = ModelXtoCtoY(n_class_attr=args.n_class_attr, pretrained=args.pretrained, freeze=args.freeze,
                          num_classes=N_CLASSES, use_aux=args.use_aux, n_attributes=args.n_attributes,
                          expand_dim=args.expand_dim, use_relu=args.use_relu, use_sigmoid=args.use_sigmoid)
     train(model, args)
 
 def train_X_to_y(args):
+    """
+    Trains a standard CNN classifier that predicts labels directly from images (X → Y).
+    """
+
     model = ModelXtoY(pretrained=args.pretrained, freeze=args.freeze, num_classes=N_CLASSES, use_aux=args.use_aux)
     train(model, args)
 
 def train_X_to_Cy(args):
+    """
+    Trains a multitask model that jointly predicts both concepts and class labels (X → (C, Y)).
+    """
+
     model = ModelXtoCY(pretrained=args.pretrained, freeze=args.freeze, num_classes=N_CLASSES, use_aux=args.use_aux,
                        n_attributes=args.n_attributes, three_class=args.three_class, connect_CY=args.connect_CY)
     train(model, args)
 
 def train_probe(args):
+    """Runs probing experiments on pre-trained representations."""
+
     probe.run(args)
 
 def test_time_intervention(args):
+    """Performs Test-Time Intervention (TTI) experiments for CBM robustness."""
+
     tti.run(args)
 
 def robustness(args):
+    """Runs synthetic robustness experiments (e.g., CUB-S synthetic generation)."""
+
     gen_cub_synthetic.run(args)
 
 def hyperparameter_optimization(args):
+    """Performs hyperparameter tuning using HyperOpt."""
+
     hyperopt.run(args)
 
 
 def parse_arguments(experiment):
+    """
+    Parses command-line arguments for different CBM experiment types.
+
+    Depending on the experiment name, returns customized argument sets for:
+        - Probe
+        - Test-Time Intervention (TTI)
+        - Robustness testing
+        - Hyperparameter optimization
+        - All major training setups (Standard, Joint, Multitask, etc.)
+
+    Args:
+        experiment (str): Type of experiment to configure.
+
+    Returns:
+        tuple: A single argparse.Namespace or related submodule-specific arguments.
+    """
+    
     # Get argparse configs from user
     parser = argparse.ArgumentParser(description='CUB Training')
     parser.add_argument('dataset', type=str, help='Name of the dataset.')
