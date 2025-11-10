@@ -74,6 +74,7 @@ def extract_data(data_dir):
     train_data = train_val_data[split :]
     val_data = train_val_data[: split]
     print('Size of train set:', len(train_data))
+    print('Size of test set:', len(test_data))
     return train_data, val_data, test_data
 
 

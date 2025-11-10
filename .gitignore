@@ -1,0 +1,7 @@
+/__pycache__/
+log.txt
+best_model_1.pth
+*.out
+*.err
+*.png
+*.sh
