@@ -1,10 +1,10 @@
-data_dir: '/Users/sneha/Downloads/CBMs'
-train_dir: '/Users/sneha/Downloads/CBMs/train.pkl'
-test_dir: '/Users/sneha/Downloads/CBMs/test.pkl'
-val_dir: '/Users/sneha/Downloads/CBMs/val.pkl'
+data_dir: '/h/sneharao/CBM'
+train_dir: '/h/sneharao/CBM/train.pkl'
+test_dir: '/h/sneharao/CBM/test.pkl'
+val_dir: '/h/sneharao/CBM/val.pkl'
 # train_csv: 'train_gt.csv'
 # test_csv: 'test_gt.csv'
-output_dir: /Users/sneha/Downloads/CBMs/logs
+output_dir: /h/sneharao/CBM/logs
 output_file: best_model_1.pth
 
 train_params:

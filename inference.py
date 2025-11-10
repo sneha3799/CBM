@@ -29,7 +29,7 @@ def eval(args):
     wrong_idx: image ids where the model got the wrong class prediction (to compare with other models)
     """
     if args.model_dir:
-        model = torch.load(args.model_dir, weights_only=False)
+        model = torch.load(args.model_dir, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     else:
         model = None
 
@@ -148,14 +148,17 @@ def eval(args):
                 print('***', attr_labels.shape)
                 print('===', attr_outputs_sigmoid)
                 print('***', attr_labels)
+                print(class_outputs)
                 attr_labels = attr_labels[:, :N_ATTRIBUTES]
-                acc = binary_accuracy(attr_outputs_sigmoid[0].squeeze(), attr_labels)
-                acc = acc.data.cpu().numpy()
+                # acc = binary_accuracy(attr_outputs_sigmoid[0].squeeze(), attr_labels)
+                acc = accuracy(class_outputs, labels)
+                print(acc)
+                # acc = acc.data.cpu().numpy()
                 # acc = accuracy(attr_outputs_sigmoid[i], attr_labels[:, i], topk=(1,))
                 attr_acc_meter[0].update(acc, inputs.size(0))
                 # if args.feature_group_results:  # keep track of accuracy of individual attributes
                 #     attr_acc_meter[i + 1].update(acc, inputs.size(0))
-                print(acc)
+                
                 attr_outputs = torch.cat([o.unsqueeze(1) for o in attr_outputs], dim=1)
                 attr_outputs_sigmoid = torch.cat([o for o in attr_outputs_sigmoid], dim=1)
                 all_attr_outputs.extend(list(attr_outputs.flatten().data.cpu().numpy()))

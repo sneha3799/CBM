@@ -23,6 +23,7 @@ def run_epoch_simple(model, optimizer, loader, loss_meter, acc_meter, criterion,
     """
     A -> Y: Predicting class labels using only attributes with MLP
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_training:
         model.train()
     else:
@@ -30,30 +31,38 @@ def run_epoch_simple(model, optimizer, loader, loss_meter, acc_meter, criterion,
     for _, data in enumerate(loader):
         inputs, labels = data
         if isinstance(inputs, list):
-            #inputs = [i.long() for i in inputs]
+            # inputs is list of attribute columns -> convert to NxD
             inputs = torch.stack(inputs).t().float()
         inputs = torch.flatten(inputs, start_dim=1).float()
-        inputs_var = torch.autograd.Variable(inputs)
-        inputs_var = inputs_var.cuda() if torch.cuda.is_available() else inputs_var
-        labels_var = torch.autograd.Variable(labels)
-        labels_var = labels_var.cuda() if torch.cuda.is_available() else labels_var
-        
+        inputs_var = inputs.to(device)
+        labels_var = labels.to(device)
+
         outputs = model(inputs_var)
-        loss = criterion(outputs, labels_var)
-        acc = accuracy(outputs, labels, topk=(1,))
+        # model may return e.g. list or single tensor; adapt:
+        if isinstance(outputs, (tuple, list)) and not isinstance(outputs, torch.Tensor):
+            # If a list and first element is main class logits, then take outputs[0]
+            # else the model may return only a tensor-like container; try to use outputs[0]
+            main_out = outputs[0] if len(outputs) > 0 else outputs
+        else:
+            main_out = outputs
+
+        loss = criterion(main_out, labels_var)
+        acc = accuracy(main_out.to('cpu'), labels.to('cpu'), topk=(1,))
         loss_meter.update(loss.item(), inputs.size(0))
-        acc_meter.update(acc[0], inputs.size(0))
+        acc_meter.update(acc, inputs.size(0))
 
         if is_training:
-            optimizer.zero_grad() #zero the parameter gradients
+            optimizer.zero_grad()
             loss.backward()
-            optimizer.step() #optimizer step to update parameters
+            optimizer.step()
     return loss_meter, acc_meter
 
 def run_epoch(model, optimizer, loader, loss_meter, acc_meter, criterion, attr_criterion, args, is_training):
     """
     For the rest of the networks (X -> A, cotraining, simple finetune)
+    Robust to models with/without aux outputs (Inception vs BcosResNet).
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_training:
         model.train()
     else:
@@ -65,67 +74,145 @@ def run_epoch(model, optimizer, loader, loss_meter, acc_meter, criterion, attr_c
             attr_labels, attr_labels_var = None, None
         else:
             inputs, labels, attr_labels = data
+            # build N x n_attributes tensor (or N x 1 for single attribute)
             if args.n_attributes > 1:
+                # attr_labels is a list per attribute -> stack and transpose -> N x n_attributes
                 attr_labels = [i.long() for i in attr_labels]
-                attr_labels = torch.stack(attr_labels).t()#.float() #N x 312
+                attr_labels = torch.stack(attr_labels).t()  # N x n_attributes
             else:
                 if isinstance(attr_labels, list):
                     attr_labels = attr_labels[0]
                 attr_labels = attr_labels.unsqueeze(1)
-            attr_labels_var = torch.autograd.Variable(attr_labels).float()
-            attr_labels_var = attr_labels_var.cuda() if torch.cuda.is_available() else attr_labels_var
+            attr_labels_var = attr_labels.float().to(device)
 
-        inputs_var = torch.autograd.Variable(inputs)
-        inputs_var = inputs_var.cuda() if torch.cuda.is_available() else inputs_var
-        labels_var = torch.autograd.Variable(labels)
-        labels_var = labels_var.cuda() if torch.cuda.is_available() else labels_var
+        inputs_var = inputs.to(device)
+        labels_var = labels.to(device)
 
-        if is_training and args.use_aux:
-            outputs, aux_outputs = model(inputs_var)
-            losses = []
-            out_start = 0
-            if not args.bottleneck: #loss main is for the main task label (always the first output)
-                loss_main = 1.0 * criterion(outputs[0], labels_var) + 0.4 * criterion(aux_outputs[0], labels_var)
-                losses.append(loss_main)
-                out_start = 1
-            if attr_criterion is not None and args.attr_loss_weight > 0: #X -> A, cotraining, end2end
-                for i in range(len(attr_criterion)):
-                    losses.append(args.attr_loss_weight * (1.0 * attr_criterion[i](outputs[i+out_start].squeeze().type(torch.FloatTensor), attr_labels_var[:, i]) \
-                                                            + 0.4 * attr_criterion[i](aux_outputs[i+out_start].squeeze().type(torch.FloatTensor), attr_labels_var[:, i])))
-        else: #testing or no aux logits
-            outputs = model(inputs_var)
-            losses = []
-            out_start = 0
-            if not args.bottleneck:
-                loss_main = criterion(outputs[0], labels_var)
-                losses.append(loss_main)
-                out_start = 1
-            if attr_criterion is not None and args.attr_loss_weight > 0: #X -> A, cotraining, end2end
-                for i in range(len(attr_criterion)):
-                    losses.append(args.attr_loss_weight * attr_criterion[i](outputs[i+out_start].squeeze().type(torch.FloatTensor), attr_labels_var[:, i]))
+        # call model
+        raw_outputs = model(inputs_var)
 
-        if args.bottleneck: #attribute accuracy
-            sigmoid_outputs = torch.nn.Sigmoid()(torch.cat(outputs, dim=1))
-            acc = binary_accuracy(sigmoid_outputs, attr_labels)
-            acc_meter.update(acc.data.cpu().numpy(), inputs.size(0))
+        # Support three common return shapes:
+        # 1) (outputs, aux_outputs)   -> two-element tuple (old Inception training-time behavior)
+        # 2) list/tuple of outputs    -> outputs[0] == class logits; outputs[1:] == attributes (or vice versa)
+        # 3) single tensor            -> class logits only
+        aux_outputs = None
+        outputs = raw_outputs
+
+        if isinstance(raw_outputs, tuple) and len(raw_outputs) == 2:
+            outputs, aux_outputs = raw_outputs
+        elif isinstance(raw_outputs, list) or isinstance(raw_outputs, tuple):
+            # keep outputs as-is (list/tuple), aux_outputs remains None
+            outputs = list(raw_outputs)
         else:
-            acc = accuracy(outputs[0], labels, topk=(1,)) #only care about class prediction accuracy
-            acc_meter.update(acc[0], inputs.size(0))
+            outputs = raw_outputs  # single tensor
 
+        # Convert any outputs that are tensors into list for uniform handling in later code:
+        outputs_is_list = isinstance(outputs, (list, tuple))
+        if not outputs_is_list:
+            # single tensor - treat as [main_logits]
+            outputs_list = [outputs]
+        else:
+            outputs_list = list(outputs)
+
+        # If aux_outputs exists and is not a tensor/list of tensors, set None
+        aux_list = None
+        if aux_outputs is not None:
+            aux_list = aux_outputs if isinstance(aux_outputs, (list, tuple)) else [aux_outputs]
+
+        # Build losses list following previous convention:
+        losses = []
+        out_start = 0
+
+        # If not bottleneck, the first element is main classification logits
+        if not args.bottleneck:
+            main_logits = outputs_list[0]
+            # ensure device alignment
+            if isinstance(main_logits, torch.Tensor):
+                main_logits = main_logits.to(device)
+            if is_training and aux_list is not None and args.use_aux:
+                aux_main = aux_list[0]
+                loss_main = 1.0 * criterion(main_logits, labels_var) + 0.4 * criterion(aux_main.to(device), labels_var)
+            else:
+                loss_main = criterion(main_logits, labels_var)
+            losses.append(loss_main)
+            out_start = 1
+
+        # Attribute losses (if any)
+        if attr_criterion is not None and args.attr_loss_weight > 0:
+            # attr_criterion is a list of criterion functions, one per attribute
+            for i in range(len(attr_criterion)):
+                idx = i + out_start
+                if idx < len(outputs_list):
+                    out_i = outputs_list[idx]
+                    # squeeze and cast as needed for BCEWithLogits (float) or CrossEntropy (long)
+                    if isinstance(attr_criterion[i], torch.nn.BCEWithLogitsLoss):
+                        logits_i = out_i.squeeze().to(device).float()
+                        target_i = attr_labels_var[:, i].to(device)
+                        if is_training and aux_list is not None and args.use_aux:
+                            aux_logits_i = aux_list[idx].squeeze().to(device).float() if idx < len(aux_list) else None
+                            if aux_logits_i is not None:
+                                losses.append(args.attr_loss_weight * (1.0 * attr_criterion[i](logits_i, target_i) + 0.4 * attr_criterion[i](aux_logits_i, target_i)))
+                            else:
+                                losses.append(args.attr_loss_weight * attr_criterion[i](logits_i, target_i))
+                        else:
+                            losses.append(args.attr_loss_weight * attr_criterion[i](logits_i, target_i))
+                    else:
+                        # CrossEntropyLoss expects long targets
+                        logits_i = out_i.squeeze().to(device)
+                        target_i = attr_labels_var[:, i].long().to(device)
+                        if is_training and aux_list is not None and args.use_aux:
+                            aux_logits_i = aux_list[idx].squeeze().to(device) if idx < len(aux_list) else None
+                            if aux_logits_i is not None:
+                                losses.append(args.attr_loss_weight * (1.0 * attr_criterion[i](logits_i, target_i) + 0.4 * attr_criterion[i](aux_logits_i, target_i)))
+                            else:
+                                losses.append(args.attr_loss_weight * attr_criterion[i](logits_i, target_i))
+                        else:
+                            losses.append(args.attr_loss_weight * attr_criterion[i](logits_i, target_i))
+                else:
+                    # Missing outputs for this attribute - add zero loss to keep indexing consistent
+                    losses.append(torch.tensor(0.0, device=device))
+
+        # Accuracy computation
+        if args.bottleneck:
+            attr_logits_list = []
+            for t in outputs_list:
+                if isinstance(t, torch.Tensor):
+                    # Ensure shape [batch, 1]
+                    if t.dim() == 1:
+                        t = t.unsqueeze(1)
+                    elif t.dim() > 2:
+                        t = t.view(t.size(0), -1)
+                    attr_logits_list.append(t.to(device))
+            if len(attr_logits_list) > 0:
+                concat_logits = torch.cat(attr_logits_list, dim=1)
+                sigmoid_outputs = torch.sigmoid(concat_logits)
+                acc = binary_accuracy(sigmoid_outputs, attr_labels[:, :args.n_attributes])
+                acc_meter.update(acc.data.cpu().numpy(), inputs.size(0))
+        else:
+            # normal classification accuracy by comparing outputs_list[0] to labels
+            main_logits = outputs_list[0]
+            acc = accuracy(main_logits.to('cpu'), labels.to('cpu'), topk=(1,))
+            acc_meter.update(acc, inputs.size(0))
+
+        # Compose total_loss
         if attr_criterion is not None:
             if args.bottleneck:
-                total_loss = sum(losses)/ args.n_attributes
-            else: #cotraining, loss by class prediction and loss by attribute prediction have the same weight
-                total_loss = losses[0] + sum(losses[1:])
+                total_loss = sum(losses) / max(1, args.n_attributes)
+            else:
+                # main loss + attribute losses
+                total_loss = losses[0] + sum(losses[1:]) if len(losses) > 0 else sum(losses)
                 if args.normalize_loss:
                     total_loss = total_loss / (1 + args.attr_loss_weight * args.n_attributes)
-        else: #finetune
-            total_loss = sum(losses)
+        else:
+            total_loss = sum(losses) if len(losses) > 0 else torch.tensor(0.0, device=device)
+
         loss_meter.update(total_loss.item(), inputs.size(0))
+
         if is_training:
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+
     return loss_meter, acc_meter
 
 def train(model, args):
@@ -138,25 +225,25 @@ def train(model, args):
         else:
             imbalance = find_class_imbalance(train_data_path, False)
 
-    # if os.path.exists(args.log_dir): # job restarted by cluster
-    #     for f in os.listdir(args.log_dir):
-    #         os.remove(os.path.join(args.log_dir, f))
-    # else:
-    #     os.makedirs(args.log_dir)
+    if os.path.exists(args.log_dir): # job restarted by cluster
+        for f in os.listdir(args.log_dir):
+            os.remove(os.path.join(args.log_dir, f))
+    else:
+        os.makedirs(args.log_dir)
 
     logger = Logger(os.path.join(args.log_dir, 'log.txt'))
     logger.write(str(args) + '\n')
     logger.write(str(imbalance) + '\n')
     logger.flush()
 
-    # model = model.cuda()
+    model = model.cuda()
     criterion = torch.nn.CrossEntropyLoss()
     if args.use_attr and not args.no_img:
         attr_criterion = [] #separate criterion (loss function) for each attribute
         if args.weighted_loss:
             assert(imbalance is not None)
             for ratio in imbalance:
-                attr_criterion.append(torch.nn.BCEWithLogitsLoss(weight=torch.FloatTensor([ratio])))
+                attr_criterion.append(torch.nn.BCEWithLogitsLoss(weight=torch.FloatTensor([ratio]).cuda()))
         else:
             for i in range(args.n_attributes):
                 attr_criterion.append(torch.nn.CrossEntropyLoss())
@@ -192,7 +279,6 @@ def train(model, args):
     best_val_acc = 0
 
     for epoch in range(0, args.epochs):
-        print('Epoch : ', epoch)
         train_loss_meter = AverageMeter()
         train_acc_meter = AverageMeter()
         if args.no_img:
@@ -235,7 +321,9 @@ def train(model, args):
             scheduler.step(epoch) #scheduler step to update lr at the end of epoch     
         #inspect lr
         if epoch % 10 == 0:
-            print('Current lr:', scheduler.get_lr())
+            # get_last_lr is available in torch >=1.4; fallback to get_lr() if older
+            lr_info = scheduler.get_last_lr() if hasattr(scheduler, "get_last_lr") else scheduler.get_lr()
+            print('Current lr:', lr_info)
 
         # if epoch % args.save_step == 0:
         #     torch.save(model, os.path.join(args.log_dir, '%d_model.pth' % epoch))
@@ -262,24 +350,10 @@ def train_Chat_to_y_and_test_on_Chat(args):
                                  num_classes=N_CLASSES, expand_dim=args.expand_dim)
     train(model, args)
 
-# def train_X_to_C_to_y(args):
-#     print('^^^^^^^^^^^^^', args.n_attributes)
-#     model = ModelXtoCtoY(n_class_attr=args.n_class_attr, pretrained=args.pretrained, freeze=args.freeze,
-#                          num_classes=N_CLASSES, use_aux=args.use_aux, n_attributes=args.n_attributes,
-#                          expand_dim=args.expand_dim, use_relu=args.use_relu, use_sigmoid=args.use_sigmoid)
-#     train(model, args)
-
 def train_X_to_C_to_y(args):
-    print(f"Training B-cos ResNet18 Joint CBM with {args.n_attributes} attributes")
-    model = ModelXtoCtoY(
-        n_class_attr=args.n_class_attr,
-        pretrained=args.pretrained,
-        freeze=args.freeze,
-        num_classes=N_CLASSES,
-        n_attributes=args.n_attributes,
-        use_relu=args.use_relu,
-        use_sigmoid=args.use_sigmoid,
-    )
+    model = ModelXtoCtoY(n_class_attr=args.n_class_attr, pretrained=args.pretrained, freeze=args.freeze,
+                         num_classes=N_CLASSES, use_aux=args.use_aux, n_attributes=args.n_attributes,
+                         expand_dim=args.expand_dim, use_relu=args.use_relu, use_sigmoid=args.use_sigmoid)
     train(model, args)
 
 def train_X_to_y(args):
@@ -291,14 +365,14 @@ def train_X_to_Cy(args):
                        n_attributes=args.n_attributes, three_class=args.three_class, connect_CY=args.connect_CY)
     train(model, args)
 
-# def train_probe(args):
-#     probe.run(args)
+def train_probe(args):
+    probe.run(args)
 
-# def test_time_intervention(args):
-#     tti.run(args)
+def test_time_intervention(args):
+    tti.run(args)
 
-# def robustness(args):
-#     gen_cub_synthetic.run(args)
+def robustness(args):
+    gen_cub_synthetic.run(args)
 
 def hyperparameter_optimization(args):
     hyperopt.run(args)
@@ -315,16 +389,16 @@ def parse_arguments(experiment):
                         help='Name of experiment to run.')
     parser.add_argument('--seed', required=True, type=int, help='Numpy and torch seed.')
 
-    # if experiment == 'Probe':
-    #     return (probe.parse_arguments(parser),)
+    if experiment == 'Probe':
+        return (probe.parse_arguments(parser),)
 
-    # elif experiment == 'TTI':
-    #     return (tti.parse_arguments(parser),)
+    elif experiment == 'TTI':
+        return (tti.parse_arguments(parser),)
 
-    # elif experiment == 'Robustness':
-    #     return (gen_cub_synthetic.parse_arguments(parser),)
+    elif experiment == 'Robustness':
+        return (gen_cub_synthetic.parse_arguments(parser),)
 
-    if experiment == 'HyperparameterSearch':
+    elif experiment == 'HyperparameterSearch':
         return (hyperopt.parse_arguments(parser),)
 
     else:
@@ -360,6 +434,8 @@ def parse_arguments(experiment):
         parser.add_argument('-end2end', action='store_true',
                             help='Whether to train X -> A -> Y end to end. Train cmd is the same as cotraining + this arg')
         parser.add_argument('-optimizer', default='SGD', help='Type of optimizer to use, options incl SGD, RMSProp, Adam')
+        parser.add_argument('--dropout_p', type=float, default=0.5,
+                    help='Dropout probability for regularization')
         parser.add_argument('-ckpt', default='', help='For retraining on both train + val set')
         parser.add_argument('-scheduler_step', type=int, default=1000,
                             help='Number of steps before decaying current learning rate by half')
